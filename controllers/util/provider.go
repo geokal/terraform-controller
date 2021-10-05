@@ -31,6 +31,7 @@ const (
 	azure   CloudProvider = "azure"
 	vsphere CloudProvider = "vsphere"
 	ec      CloudProvider = "ec"
+	os			CloudProvider = "os"
 )
 
 const (
@@ -60,6 +61,16 @@ const (
 	errConvertCredentials        = "failed to convert the credentials of Secret from Provider"
 
 	envECApiKey = "EC_API_KEY"
+
+	envOSAuth							= "OS_AUTH_URL"
+	envOSTenantName       = "OS_TENANT_NAME"
+	envOSUserName					= "OS_USERNAME"
+	envOSPassword					= "OS_PASSWORD"
+	envOSProjectName      = "OS_PROJECT_NAME"
+	envOSProjectDomain		= "OS_PROJECT_DOMAIN_ID"
+	envOSUserDomainID 		=	"OS_USER_DOMAIN_ID"
+	envOSUserDomainName 	= "OS_USER_DOMAIN_NAME"
+	envOSIdentityApiVer   = "OS_IDENTITY_API_VERSION"
 )
 
 // AlibabaCloudCredentials are credentials for Alibaba Cloud
@@ -101,6 +112,18 @@ type VSphereCredentials struct {
 // ECCredentials are credentials for Elastic CLoud
 type ECCredentials struct {
 	ECApiKey string `yaml:"ecApiKey"`
+}
+
+type OpenstackCredentials struct {
+	OSAuth 							string `yaml:"osAuth"`				
+	OSTenantName 				string `yaml:"osTenantName"`
+	OSUserName 					string `yaml:"osUserName"`
+	OSPassword 					string `yaml:"osPassword"`
+	OSProjectName 			string `yaml:"osProjectName"`
+	OSProjectDomain 		string `yaml:"osProjectDomain"`
+	OSUserDomainID 			string `yaml:"osUserDomainID"`
+	OSUserDomainName 		string `yaml:"osUserDomainName"`
+	OSIdentityApiVer 		string `yaml:"osIdentityApiVer"`
 }
 
 // GetProviderCredentials gets provider credentials by cloud provider name
@@ -194,6 +217,23 @@ func GetProviderCredentials(ctx context.Context, k8sClient client.Client, namesp
 			}
 			return map[string]string{
 				envECApiKey: ak.ECApiKey,
+			}, nil
+		case string(os):
+			var ak OpenstackCredentials
+			if err := yaml.Unmarshal(secret.Data[secretRef.Key], &ak); err != nil {
+				klog.ErrorS(err, errConvertCredentials, "Name", secretRef.Name, "Namespace", secretRef.Namespace)
+				return nil, errors.Wrap(err, errConvertCredentials)
+			}
+			return map[string]string{
+				envOSAuth:      			ak.OSAuth,
+				envOSTenantName:			ak.OSTenantName,
+				envOSUserName:				ak.OSUserName,
+				envOSPassword:				ak.OSPassword,
+				envOSProjectName:			ak.OSProjectName,
+				envOSProjectDomain:		ak.OSProjectDomain,
+				envOSUserDomainID:		ak.OSUserDomainID,
+				envOSUserDomainName:	ak.OSUserDomainName,
+				envOSIdentityApiVer:	ak.OSIdentityApiVer
 			}, nil
 		}
 	default:
