@@ -31,11 +31,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/oam-dev/terraform-controller/api/types"
+	crossplane "github.com/oam-dev/terraform-controller/api/types/crossplane-runtime"
 	"github.com/oam-dev/terraform-controller/api/v1beta1"
 	cfgvalidator "github.com/oam-dev/terraform-controller/controllers/configuration"
 	"github.com/oam-dev/terraform-controller/controllers/util"
@@ -43,7 +43,6 @@ import (
 )
 
 const (
-	terraformInitContainerImg = "busybox:latest"
 	// TerraformImage is the Terraform image which can run `terraform init/plan/apply`
 	terraformImage     = "oamdev/docker-terraform:1.0.6"
 	terraformWorkspace = "default"
@@ -54,8 +53,12 @@ const (
 	WorkingVolumeMountPath = "/data"
 	// InputTFConfigurationVolumeName is the volume name for input Terraform Configuration
 	InputTFConfigurationVolumeName = "tf-input-configuration"
+	// BackendVolumeName is the volume name for Terraform backend
+	BackendVolumeName = "tf-backend"
 	// InputTFConfigurationVolumeMountPath is the volume mount path for input Terraform Configuration
-	InputTFConfigurationVolumeMountPath = "/opt/tfconfiguration"
+	InputTFConfigurationVolumeMountPath = "/opt/tf-configuration"
+	// BackendVolumeMountPath is the volume mount path for Terraform backend
+	BackendVolumeMountPath = "/opt/tf-backend"
 )
 
 const (
@@ -94,6 +97,8 @@ const (
 	MessageCloudResourceDestroying = "Cloud resources is being destroyed..."
 	// ErrProviderNotReady means provider object is not ready
 	ErrProviderNotReady = "Provider is not ready"
+	// MessageProviderReady means provider object is ready
+	MessageProviderReady = "Provider is ready"
 )
 
 // ConfigurationReconciler reconciles a Configuration object.
@@ -106,18 +111,39 @@ type ConfigurationReconciler struct {
 
 var controllerNamespace = os.Getenv("CONTROLLER_NAMESPACE")
 
+// TFConfigurationMeta is all the metadata of a Configuration
+type TFConfigurationMeta struct {
+	Name                  string
+	Namespace             string
+	ConfigurationType     types.ConfigurationType
+	CompleteConfiguration string
+	RemoteGit             string
+	ConfigurationChanged  bool
+	ConfigurationCMName   string
+	BackendCMName         string
+	ApplyJobName          string
+	DestroyJobName        string
+	Envs                  []v1.EnvVar
+	ProviderReference     *crossplane.Reference
+}
+
 // +kubebuilder:rbac:groups=terraform.core.oam.dev,resources=configurations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=terraform.core.oam.dev,resources=configurations/status,verbs=get;update;patch
 
 // Reconcile will reconcile periodically
 func (r *ConfigurationReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	var (
-		configuration         v1beta1.Configuration
-		ctx                   = context.Background()
-		tfInputConfigMapsName = fmt.Sprintf(TFInputConfigMapName, req.Name)
+		configuration v1beta1.Configuration
+		ctx           = context.Background()
+		meta          = &TFConfigurationMeta{
+			Namespace:           controllerNamespace,
+			Name:                req.Name,
+			ConfigurationCMName: fmt.Sprintf(TFInputConfigMapName, req.Name),
+			ApplyJobName:        req.Name + "-" + string(TerraformApply),
+			DestroyJobName:      req.Name + "-" + string(TerraformDestroy),
+		}
 	)
 	klog.InfoS("reconciling Terraform Configuration...", "NamespacedName", req.NamespacedName)
-	applyJobName := req.Name + "-" + string(TerraformApply)
 
 	if err := r.Get(ctx, req.NamespacedName, &configuration); err != nil {
 		if kerrors.IsNotFound(err) {
@@ -125,6 +151,16 @@ func (r *ConfigurationReconciler) Reconcile(req ctrl.Request) (ctrl.Result, erro
 			err = nil
 		}
 		return ctrl.Result{}, err
+	}
+	meta.RemoteGit = configuration.Spec.Remote
+
+	if configuration.Spec.ProviderReference != nil {
+		meta.ProviderReference = configuration.Spec.ProviderReference
+	} else {
+		meta.ProviderReference = &crossplane.Reference{
+			Name:      util.ProviderDefaultName,
+			Namespace: util.ProviderDefaultNamespace,
+		}
 	}
 
 	if configuration.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -136,23 +172,20 @@ func (r *ConfigurationReconciler) Reconcile(req ctrl.Request) (ctrl.Result, erro
 		}
 	}
 
-	configurationChanged, err := r.preCheck(ctx, req.Namespace, &configuration, tfInputConfigMapsName)
-	if err != nil {
+	if err := r.preCheck(ctx, &configuration, meta); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if !configuration.ObjectMeta.DeletionTimestamp.IsZero() {
 		// terraform destroy
-		if controllerutil.ContainsFinalizer(&configuration, configurationFinalizer) {
-			klog.InfoS("performing Terraform Destroy", "Namespace", req.Namespace, "Name", req.Name)
-			destroyJobName := req.Name + "-" + string(TerraformDestroy)
-			klog.InfoS("Terraform destroy job", "Namespace", req.Namespace, "Name", destroyJobName)
-			if err := r.terraformDestroy(ctx, req.Namespace, configuration, configurationChanged, destroyJobName, tfInputConfigMapsName, applyJobName); err != nil {
-				if err.Error() == MessageDestroyJobNotCompleted {
-					return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-				}
-				return ctrl.Result{RequeueAfter: 3 * time.Second}, errors.Wrap(err, "continue reconciling to destroy cloud resource")
+		klog.InfoS("Performing Configuration Destroy", "Namespace", req.Namespace, "Name", req.Name, "JobName", meta.DestroyJobName)
+		if err := r.terraformDestroy(ctx, configuration, meta); err != nil {
+			if err.Error() == MessageDestroyJobNotCompleted {
+				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 			}
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, errors.Wrap(err, "continue reconciling to destroy cloud resource")
+		}
+		if controllerutil.ContainsFinalizer(&configuration, configurationFinalizer) {
 			controllerutil.RemoveFinalizer(&configuration, configurationFinalizer)
 			if err := r.Update(ctx, &configuration); err != nil {
 				return ctrl.Result{RequeueAfter: 3 * time.Second}, errors.Wrap(err, "failed to remove finalizer")
@@ -162,14 +195,14 @@ func (r *ConfigurationReconciler) Reconcile(req ctrl.Request) (ctrl.Result, erro
 	}
 
 	// Terraform apply (create or update)
-	if configuration.Status.Apply.State == types.ConfigurationSyntaxError || configuration.Status.Apply.State == types.ProviderNotReady {
+	if configuration.Status.Apply.State == types.ConfigurationSyntaxError {
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 	klog.InfoS("performing Terraform Apply (cloud resource create/update)", "Namespace", req.Namespace, "Name", req.Name)
 	if configuration.Spec.ProviderReference != nil {
 		r.ProviderName = configuration.Spec.ProviderReference.Name
 	}
-	if err := r.terraformApply(ctx, req.Namespace, configuration, configurationChanged, applyJobName, tfInputConfigMapsName); err != nil {
+	if err := r.terraformApply(ctx, req.Namespace, configuration, meta); err != nil {
 		if err.Error() == MessageApplyJobNotCompleted {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
@@ -178,9 +211,8 @@ func (r *ConfigurationReconciler) Reconcile(req ctrl.Request) (ctrl.Result, erro
 	return ctrl.Result{}, nil
 }
 
-func (r *ConfigurationReconciler) terraformApply(ctx context.Context, namespace string, configuration v1beta1.Configuration,
-	configurationChanged bool, applyJobName, tfInputConfigMapsName string) error {
-	klog.InfoS("terraform apply job", "Namespace", namespace, "Name", applyJobName)
+func (r *ConfigurationReconciler) terraformApply(ctx context.Context, namespace string, configuration v1beta1.Configuration, meta *TFConfigurationMeta) error {
+	klog.InfoS("terraform apply job", "Namespace", namespace, "Name", meta.ApplyJobName)
 
 	var (
 		k8sClient      = r.Client
@@ -188,45 +220,50 @@ func (r *ConfigurationReconciler) terraformApply(ctx context.Context, namespace 
 	)
 
 	// start provisioning and check the status of the provision
-	if configuration.Status.Apply.State != types.Available {
-		// For not serious, we don't want to throw an error
-		updateStatus(ctx, k8sClient, configuration, types.ConfigurationProvisioningAndChecking, MessageCloudResourceProvisioningAndChecking) //nolint:errcheck
-	}
-
-	if err := k8sClient.Get(ctx, client.ObjectKey{Name: applyJobName, Namespace: controllerNamespace}, &tfExecutionJob); err != nil {
-		if kerrors.IsNotFound(err) {
-			return assembleAndTriggerJob(ctx, k8sClient, configuration.Name, &configuration, tfInputConfigMapsName, namespace, r.ProviderName, TerraformApply)
+	if configuration.Status.Apply.State != types.Available && configuration.Status.Apply.State != types.ProviderNotReady {
+		configuration.Status.Apply = v1beta1.ConfigurationApplyStatus{
+			State:   types.ConfigurationProvisioningAndChecking,
+			Message: MessageCloudResourceProvisioningAndChecking,
 		}
 	}
 
-	if err := r.updateTerraformJobIfNeeded(ctx, namespace, configuration, tfExecutionJob, configurationChanged); err != nil {
-		klog.ErrorS(err, ErrUpdateTerraformApplyJob, "Name", applyJobName)
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: meta.ApplyJobName, Namespace: controllerNamespace}, &tfExecutionJob); err != nil {
+		if kerrors.IsNotFound(err) {
+			return meta.assembleAndTriggerJob(ctx, k8sClient, &configuration, TerraformApply)
+		}
+	}
+
+	if err := meta.updateTerraformJobIfNeeded(ctx, k8sClient, configuration, tfExecutionJob, meta.ConfigurationChanged); err != nil {
+		klog.ErrorS(err, ErrUpdateTerraformApplyJob, "Name", meta.ApplyJobName)
 		return errors.Wrap(err, ErrUpdateTerraformApplyJob)
 	}
 
 	if tfExecutionJob.Status.Succeeded == int32(1) && configuration.Status.Apply.State != types.Available {
-		return updateStatus(ctx, k8sClient, configuration, types.Available, MessageCloudResourceDeployed)
+		configuration.Status.Apply = v1beta1.ConfigurationApplyStatus{
+			State:   types.Available,
+			Message: MessageCloudResourceDeployed,
+		}
 	}
-	return nil
+	return updateStatus(ctx, k8sClient, configuration, configuration.Status.Apply.State, configuration.Status.Apply.Message)
 }
 
-func (r *ConfigurationReconciler) terraformDestroy(ctx context.Context, namespace string, configuration v1beta1.Configuration,
-	configurationChanged bool, destroyJobName, tfInputConfigMapsName, applyJobName string) error {
+func (r *ConfigurationReconciler) terraformDestroy(ctx context.Context, configuration v1beta1.Configuration, meta *TFConfigurationMeta) error {
 	var (
 		destroyJob batchv1.Job
 		k8sClient  = r.Client
 	)
-
 	if configuration.Status.Apply.State == types.ConfigurationProvisioningAndChecking {
 		warning := fmt.Sprintf("Destroy could not complete and needs to wait for Provision to complet first: %s", MessageCloudResourceProvisioningAndChecking)
 		klog.Warning(warning)
 		return errors.New(warning)
 	}
 
-	if err := k8sClient.Get(ctx, client.ObjectKey{Name: destroyJobName, Namespace: controllerNamespace}, &destroyJob); err != nil {
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: meta.DestroyJobName, Namespace: meta.Namespace}, &destroyJob); err != nil {
 		if kerrors.IsNotFound(err) {
-			if err = assembleAndTriggerJob(ctx, k8sClient, configuration.Name, &configuration, tfInputConfigMapsName, namespace, r.ProviderName, TerraformDestroy); err != nil {
-				return err
+			if err := r.Client.Get(ctx, client.ObjectKey{Name: configuration.Name, Namespace: configuration.Namespace}, &v1beta1.Configuration{}); err == nil {
+				if err = meta.assembleAndTriggerJob(ctx, k8sClient, &configuration, TerraformDestroy); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -236,15 +273,15 @@ func (r *ConfigurationReconciler) terraformDestroy(ctx context.Context, namespac
 		return err
 	}
 
-	if err := r.updateTerraformJobIfNeeded(ctx, namespace, configuration, destroyJob, configurationChanged); err != nil {
-		klog.ErrorS(err, ErrUpdateTerraformApplyJob, "Name", applyJobName)
+	if err := meta.updateTerraformJobIfNeeded(ctx, k8sClient, configuration, destroyJob, meta.ConfigurationChanged); err != nil {
+		klog.ErrorS(err, ErrUpdateTerraformApplyJob, "Name", meta.ApplyJobName)
 		return errors.Wrap(err, ErrUpdateTerraformApplyJob)
 	}
 
 	// When the deletion Job process succeeded, clean up work is starting.
-	if destroyJob.Status.Succeeded == *pointer.Int32Ptr(1) {
+	if destroyJob.Status.Succeeded == int32(1) {
 		// 1. delete Terraform input Configuration ConfigMap
-		if err := deleteConfigMap(ctx, k8sClient, tfInputConfigMapsName); err != nil {
+		if err := deleteConfigMap(ctx, k8sClient, meta.ConfigurationCMName); err != nil {
 			return err
 		}
 
@@ -259,56 +296,67 @@ func (r *ConfigurationReconciler) terraformDestroy(ctx context.Context, namespac
 
 		// 3. delete apply job
 		var applyJob batchv1.Job
-		if err := k8sClient.Get(ctx, client.ObjectKey{Name: applyJobName, Namespace: controllerNamespace}, &applyJob); err == nil {
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: meta.ApplyJobName, Namespace: controllerNamespace}, &applyJob); err == nil {
 			if err := k8sClient.Delete(ctx, &applyJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
 				return err
 			}
 		}
 
 		// 4. delete destroy job
-		return k8sClient.Delete(ctx, &destroyJob, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		var j batchv1.Job
+		if err := r.Client.Get(ctx, client.ObjectKey{Name: destroyJob.Name, Namespace: destroyJob.Namespace}, &j); err == nil {
+			return r.Client.Delete(ctx, &j, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		}
 	}
 	return errors.New(MessageDestroyJobNotCompleted)
 }
 
-func (r *ConfigurationReconciler) preCheck(ctx context.Context, namespace string, configuration *v1beta1.Configuration, tfInputConfigMapsName string) (bool, error) {
-	var (
-		k8sClient = r.Client
-	)
-
-	var inputConfigurationCM v1.ConfigMap
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: tfInputConfigMapsName, Namespace: namespace}, &inputConfigurationCM); err != nil {
-		if kerrors.IsNotFound(err) {
-			klog.InfoS("The input Configuration ConfigMaps doesn't exist", "Namespace", namespace, "Name", tfInputConfigMapsName)
-		} else {
-			return false, err
-		}
-	}
+func (r *ConfigurationReconciler) preCheck(ctx context.Context, configuration *v1beta1.Configuration, meta *TFConfigurationMeta) error {
+	var k8sClient = r.Client
 
 	// Validation: 1) validate Configuration itself
 	configurationType, err := cfgvalidator.ValidConfigurationObject(configuration)
 	if err != nil {
-		return false, updateStatus(ctx, k8sClient, *configuration, types.ConfigurationStaticChecking, err.Error())
+		return updateStatus(ctx, k8sClient, *configuration, types.ConfigurationStaticChecking, err.Error())
 	}
+	meta.ConfigurationType = configurationType
 
 	// Validation: 2) validate Configuration syntax
-	if err := cfgvalidator.CheckConfigurationSyntax(configuration, configurationType); err != nil {
-		return false, updateStatus(ctx, k8sClient, *configuration, types.ConfigurationSyntaxError, err.Error())
+	preState, err := cfgvalidator.CheckConfigurationSyntax(configuration, configurationType)
+	if err != nil {
+		return updateStatus(ctx, k8sClient, *configuration, types.ConfigurationSyntaxError, err.Error())
 	}
 	if configuration.Status.Apply.State == types.ConfigurationSyntaxError {
 		updateStatus(ctx, k8sClient, *configuration, types.ConfigurationSyntaxGood, "") //nolint:errcheck
 	}
 
-	// Compose configuration with backend, and check whether configuration(hcl/json) is changed
-	completeConfiguration, configurationChanged, err := cfgvalidator.ComposeConfiguration(configuration, controllerNamespace, configurationType, &inputConfigurationCM)
+	// Render configuration with backend
+	completeConfiguration, err := cfgvalidator.RenderConfiguration(configuration, controllerNamespace, configurationType, preState)
 	if err != nil {
-		return false, err
+		return err
 	}
+	meta.CompleteConfiguration = completeConfiguration
+
+	var inputConfigurationCM v1.ConfigMap
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: meta.ConfigurationCMName, Namespace: controllerNamespace}, &inputConfigurationCM); err != nil {
+		if kerrors.IsNotFound(err) {
+			klog.InfoS("The input Configuration ConfigMaps doesn't exist", "Namespace", controllerNamespace, "Name", meta.ConfigurationCMName)
+		} else {
+			return err
+		}
+	}
+
+	// Check whether configuration(hcl/json) is changed
+	configurationChanged, err := cfgvalidator.CheckWhetherConfigurationChanges(configurationType, &inputConfigurationCM, completeConfiguration)
+	if err != nil {
+		return err
+	}
+	meta.ConfigurationChanged = configurationChanged
 	if configurationChanged {
 		// store configuration to ConfigMap
-		return configurationChanged, storeTFConfiguration(ctx, k8sClient, configurationType, completeConfiguration, tfInputConfigMapsName)
+		return meta.storeTFConfiguration(ctx, k8sClient)
 	}
-	return false, nil
+	return nil
 }
 
 func updateStatus(ctx context.Context, k8sClient client.Client, configuration v1beta1.Configuration, state types.ConfigurationState, message string) error {
@@ -333,25 +381,24 @@ func updateStatus(ctx context.Context, k8sClient client.Client, configuration v1
 	return k8sClient.Status().Update(ctx, &configuration)
 }
 
-func assembleAndTriggerJob(ctx context.Context, k8sClient client.Client, name string, configuration *v1beta1.Configuration,
-	tfInputConfigMapsName, providerNamespace, providerName string, executionType TerraformExecutionType) error {
-	jobName := name + "-" + string(executionType)
-
-	envs, err := prepareTFVariables(ctx, k8sClient, configuration, providerName, providerNamespace)
+func (meta *TFConfigurationMeta) assembleAndTriggerJob(ctx context.Context, k8sClient client.Client,
+	configuration *v1beta1.Configuration, executionType TerraformExecutionType) error {
+	envs, err := meta.prepareTFVariables(ctx, k8sClient, configuration)
 	if err != nil {
 		return err
 	}
+	meta.Envs = envs
 
-	job := assembleTerraformJob(name, jobName, tfInputConfigMapsName, envs, executionType)
+	job := meta.assembleTerraformJob(executionType)
 	return k8sClient.Create(ctx, job)
 }
 
 // updateTerraformJob will set deletion finalizer to the Terraform job if its envs are changed, which will result in
 // deleting the job. Finally a new Terraform job will be generated
-func (r *ConfigurationReconciler) updateTerraformJobIfNeeded(ctx context.Context, namespace string,
-	configuration v1beta1.Configuration, job batchv1.Job, configurationChanged bool) error {
+func (meta *TFConfigurationMeta) updateTerraformJobIfNeeded(ctx context.Context, k8sClient client.Client, configuration v1beta1.Configuration,
+	job batchv1.Job, configurationChanged bool) error {
 
-	envs, err := prepareTFVariables(ctx, r.Client, &configuration, r.ProviderName, namespace)
+	envs, err := meta.prepareTFVariables(ctx, k8sClient, &configuration)
 	if err != nil {
 		return err
 	}
@@ -369,28 +416,66 @@ func (r *ConfigurationReconciler) updateTerraformJobIfNeeded(ctx context.Context
 
 	// if either one changes, delete the job
 	if envChanged || configurationChanged {
-		return r.Client.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		var j batchv1.Job
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: job.Name, Namespace: job.Namespace}, &j); err == nil {
+			return k8sClient.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		}
 	}
 	return nil
 }
 
-func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, envs []v1.EnvVar, executionType TerraformExecutionType) *batchv1.Job {
-	var parallelism int32 = 1
-	var completions int32 = 1
+func (meta *TFConfigurationMeta) assembleTerraformJob(executionType TerraformExecutionType) *batchv1.Job {
+	var (
+		initContainer  v1.Container
+		initContainers []v1.Container
+		parallelism    int32 = 1
+		completions    int32 = 1
+	)
 
+	executorVolumes := meta.assembleExecutorVolumes()
 	initContainerVolumeMounts := []v1.VolumeMount{
 		{
-			Name:      name,
+			Name:      meta.Name,
 			MountPath: WorkingVolumeMountPath,
 		},
 		{
 			Name:      InputTFConfigurationVolumeName,
 			MountPath: InputTFConfigurationVolumeMountPath,
 		},
+		{
+			Name:      BackendVolumeName,
+			MountPath: BackendVolumeMountPath,
+		},
 	}
-	initContainerCMD := fmt.Sprintf("cp %s/* %s", InputTFConfigurationVolumeMountPath, WorkingVolumeMountPath)
 
-	executorVolumes := assembleExecutorVolumes(name, tfInputConfigMapsName)
+	initContainer = v1.Container{
+		Name:            "prepare-input-terraform-configurations",
+		Image:           "busybox:latest",
+		ImagePullPolicy: v1.PullIfNotPresent,
+		Command: []string{
+			"sh",
+			"-c",
+			fmt.Sprintf("cp %s/* %s", InputTFConfigurationVolumeMountPath, WorkingVolumeMountPath),
+		},
+		VolumeMounts: initContainerVolumeMounts,
+	}
+	initContainers = append(initContainers, initContainer)
+
+	if meta.RemoteGit != "" {
+		initContainers = append(initContainers,
+			v1.Container{
+				Name:            "git-configuration",
+				Image:           "alpine/git:latest",
+				ImagePullPolicy: v1.PullIfNotPresent,
+				Command: []string{
+					"sh",
+					"-c",
+					fmt.Sprintf("git clone %s %s && cp -r %s/* %s", meta.RemoteGit, BackendVolumeMountPath,
+						BackendVolumeMountPath, WorkingVolumeMountPath),
+				},
+				VolumeMounts: initContainerVolumeMounts,
+			})
+	}
 
 	return &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{
@@ -398,7 +483,7 @@ func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, en
 			APIVersion: "batch/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
+			Name:      meta.Name + "-" + string(executionType),
 			Namespace: controllerNamespace,
 		},
 		Spec: batchv1.JobSpec{
@@ -408,17 +493,7 @@ func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, en
 				Spec: v1.PodSpec{
 					// InitContainer will copy Terraform configuration files to working directory and create Terraform
 					// state file directory in advance
-					InitContainers: []v1.Container{{
-						Name:            "prepare-input-terraform-configurations",
-						Image:           terraformInitContainerImg,
-						ImagePullPolicy: v1.PullIfNotPresent,
-						Command: []string{
-							"sh",
-							"-c",
-							initContainerCMD,
-						},
-						VolumeMounts: initContainerVolumeMounts,
-					}},
+					InitContainers: initContainers,
 					// Container terraform-executor will first copy predefined terraform.d to working directory, and
 					// then run terraform init/apply.
 					Containers: []v1.Container{{
@@ -432,7 +507,7 @@ func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, en
 						},
 						VolumeMounts: []v1.VolumeMount{
 							{
-								Name:      name,
+								Name:      meta.Name,
 								MountPath: WorkingVolumeMountPath,
 							},
 							{
@@ -440,7 +515,7 @@ func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, en
 								MountPath: InputTFConfigurationVolumeMountPath,
 							},
 						},
-						Env: envs,
+						Env: meta.Envs,
 					},
 					},
 					ServiceAccountName: "tf-executor-service-account",
@@ -452,19 +527,27 @@ func assembleTerraformJob(name, jobName string, tfInputConfigMapsName string, en
 	}
 }
 
-func assembleExecutorVolumes(name, tfInputConfigMapsName string) []v1.Volume {
-	workingVolume := v1.Volume{Name: name}
+func (meta *TFConfigurationMeta) assembleExecutorVolumes() []v1.Volume {
+	workingVolume := v1.Volume{Name: meta.Name}
 	workingVolume.EmptyDir = &v1.EmptyDirVolumeSource{}
-	inputTFConfigurationVolume := createConfigurationVolume(tfInputConfigMapsName)
-	return []v1.Volume{workingVolume, inputTFConfigurationVolume}
+	inputTFConfigurationVolume := meta.createConfigurationVolume()
+	tfBackendVolume := meta.createTFBackendVolume()
+	return []v1.Volume{workingVolume, inputTFConfigurationVolume, tfBackendVolume}
 }
 
-func createConfigurationVolume(tfInputConfigMapsName string) v1.Volume {
+func (meta *TFConfigurationMeta) createConfigurationVolume() v1.Volume {
 	inputCMVolumeSource := v1.ConfigMapVolumeSource{}
-	inputCMVolumeSource.Name = tfInputConfigMapsName
+	inputCMVolumeSource.Name = meta.ConfigurationCMName
 	inputTFConfigurationVolume := v1.Volume{Name: InputTFConfigurationVolumeName}
 	inputTFConfigurationVolume.ConfigMap = &inputCMVolumeSource
 	return inputTFConfigurationVolume
+
+}
+
+func (meta *TFConfigurationMeta) createTFBackendVolume() v1.Volume {
+	gitVolume := v1.Volume{Name: BackendVolumeName}
+	gitVolume.EmptyDir = &v1.EmptyDirVolumeSource{}
+	return gitVolume
 }
 
 // TFState is Terraform State
@@ -542,11 +625,14 @@ func getTFOutputs(ctx context.Context, k8sClient client.Client, configuration v1
 	return outputs, nil
 }
 
-func prepareTFVariables(ctx context.Context, k8sClient client.Client, configuration *v1beta1.Configuration, providerName, providerNamespace string) ([]v1.EnvVar, error) {
+func (meta *TFConfigurationMeta) prepareTFVariables(ctx context.Context, k8sClient client.Client, configuration *v1beta1.Configuration) ([]v1.EnvVar, error) {
 	var envs []v1.EnvVar
 
 	if configuration == nil {
 		return nil, errors.New("configuration is nil")
+	}
+	if meta.ProviderReference == nil {
+		return nil, errors.New("The referenced provider could not be retrieved")
 	}
 
 	tfVariable, err := getTerraformJSONVariable(configuration.Spec.Variable)
@@ -557,12 +643,17 @@ func prepareTFVariables(ctx context.Context, k8sClient client.Client, configurat
 		envs = append(envs, v1.EnvVar{Name: k, Value: v})
 	}
 
-	credential, err := util.GetProviderCredentials(ctx, k8sClient, providerNamespace, providerName)
+	credential, err := util.GetProviderCredentials(ctx, k8sClient, meta.ProviderReference.Namespace, meta.ProviderReference.Name)
 	if err != nil {
 		if updateStatusErr := updateStatus(ctx, k8sClient, *configuration, types.ProviderNotReady, ErrProviderNotReady); updateStatusErr != nil {
 			return nil, errors.Wrap(updateStatusErr, errSettingStatus)
 		}
 		return nil, errors.Wrap(err, ErrProviderNotReady)
+	}
+	if configuration.Status.Apply.State == types.ProviderNotReady {
+		if updateStatusErr := updateStatus(ctx, k8sClient, *configuration, types.ProviderReady, MessageProviderReady); updateStatusErr != nil {
+			return nil, errors.Wrap(updateStatusErr, errSettingStatus)
+		}
 	}
 	for k, v := range credential {
 		envs = append(envs,
@@ -619,14 +710,14 @@ func deleteConnectionSecret(ctx context.Context, k8sClient client.Client, name, 
 	return nil
 }
 
-func createOrUpdateConfigMap(ctx context.Context, k8sClient client.Client, name string, data map[string]string) error {
+func (meta *TFConfigurationMeta) createOrUpdateConfigMap(ctx context.Context, k8sClient client.Client, data map[string]string) error {
 	var gotCM v1.ConfigMap
-	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: controllerNamespace}, &gotCM); err != nil {
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: meta.ConfigurationCMName, Namespace: controllerNamespace}, &gotCM); err != nil {
 		if kerrors.IsNotFound(err) {
 			cm := v1.ConfigMap{
 				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
+					Name:      meta.ConfigurationCMName,
 					Namespace: controllerNamespace,
 				},
 				Data: data,
@@ -641,20 +732,22 @@ func createOrUpdateConfigMap(ctx context.Context, k8sClient client.Client, name 
 	return errors.Wrap(err, "failed to update TF configuration ConfigMap")
 }
 
-func prepareTFInputConfigurationData(configurationType types.ConfigurationType, inputConfiguration string) map[string]string {
+func (meta *TFConfigurationMeta) prepareTFInputConfigurationData() map[string]string {
 	var dataName string
-	switch configurationType {
+	switch meta.ConfigurationType {
 	case types.ConfigurationJSON:
 		dataName = types.TerraformJSONConfigurationName
 	case types.ConfigurationHCL:
 		dataName = types.TerraformHCLConfigurationName
+	case types.ConfigurationRemote:
+		dataName = "terraform-backend.tf"
 	}
-	data := map[string]string{dataName: inputConfiguration, "kubeconfig": ""}
+	data := map[string]string{dataName: meta.CompleteConfiguration, "kubeconfig": ""}
 	return data
 }
 
 // storeTFConfiguration will store Terraform configuration to ConfigMap
-func storeTFConfiguration(ctx context.Context, k8sClient client.Client, configurationType types.ConfigurationType, inputConfiguration string, tfInputConfigMapsName string) error {
-	data := prepareTFInputConfigurationData(configurationType, inputConfiguration)
-	return createOrUpdateConfigMap(ctx, k8sClient, tfInputConfigMapsName, data)
+func (meta *TFConfigurationMeta) storeTFConfiguration(ctx context.Context, k8sClient client.Client) error {
+	data := meta.prepareTFInputConfigurationData()
+	return meta.createOrUpdateConfigMap(ctx, k8sClient, data)
 }
